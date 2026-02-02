@@ -1,0 +1,17 @@
+sudo journalctl -u thermal-stream.service -f
+sudo journalctl -u robot-bridge -f
+sudo systemctl status robot-bridge.service
+sudo nano /etc/dhcpcd.conf
+# ... (keep all your existing lines above) ...
+
+# --- ROBOT STATIC IP CONFIGURATION ---
+interface eth0
+static ip_address=192.168.1.100/24
+static routers=192.168.1.1
+static domain_name_servers=192.168.1.1 8.8.8.8
+
+sudo systemctl status thermal_stream.service
+journalctl -u thermal_stream.service -f
+
+sudo systemctl status robot_bridge.service
+journalctl -u robot_bridge.service -f

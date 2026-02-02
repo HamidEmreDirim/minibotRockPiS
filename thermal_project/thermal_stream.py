@@ -4,120 +4,181 @@ import socket
 import struct
 import sys
 import time
-import glob
 import numpy as np
+import os
+import logging
+import signal
+import argparse
+import glob
 
-# --- CONFIGURATION ---
-DEST_IP = "192.168.50.22"   
-DEST_PORT = 5000
-RETRY_SLEEP = 2.0 
 
-def find_camera_device():
-    """Find a working /dev/video* and return the path."""
-    candidates = sorted(glob.glob("/dev/video*"))
-    if not candidates:
-        print("[thermal_stream] No /dev/video* found.")
-        return None
+# --- DEFAULT CONFIGURATION ---
+# (Can be overridden via command line args)
+DEFAULT_IP = "192.168.50.22"
+DEFAULT_PORT = 5000
+DEFAULT_DEVICE = "/dev/thermal_camera"
+TARGET_FPS = 20  # Limit FPS to save bandwidth/CPU
+RETRY_DELAY = 2.0
 
-    for dev in candidates:
-        cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            cap.release()
-            continue
+# Setup Logging for Systemd
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("thermal_stream")
 
-        for _ in range(5):
-            ret, frame = cap.read()
-            if ret and frame is not None:
-                print(f"[thermal_stream] Found valid camera at {dev}")
-                return cap, dev
-            time.sleep(0.1)
+# Global flag for graceful shutdown
+running = True
 
-        cap.release()
-    return None
+def handle_signal(signum, frame):
+    """Handle system signals (like SIGTERM from systemd) to stop gracefully."""
+    global running
+    logger.info(f"Received signal {signum}. Stopping service...")
+    running = False
 
-def wait_for_camera():
-    while True:
-        result = find_camera_device()
-        if result is not None:
-            return result
-        print(f"[thermal_stream] Camera not ready, retrying in {RETRY_SLEEP}s.")
-        time.sleep(RETRY_SLEEP)
-
-def connect_socket():
-    while True:
+def connect_socket(ip, port):
+    """Establishes a socket connection to the receiver."""
+    while running:
         try:
-            print(f"[thermal_stream] Connecting to {DEST_IP}:{DEST_PORT} ...")
+            logger.info(f"Connecting to {ip}:{port}...")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.settimeout(5.0) 
-            sock.connect((DEST_IP, DEST_PORT))
-            sock.settimeout(None)
-            print("[thermal_stream] Connected to receiver.")
+            sock.settimeout(5.0)
+            sock.connect((ip, port))
+            sock.settimeout(None) # Remove timeout for blocking sends
+            logger.info("Connected to receiver.")
             return sock
         except (OSError, socket.timeout) as e:
-            print(f"[thermal_stream] Connect failed: {e}, retrying in {RETRY_SLEEP}s.")
-            time.sleep(RETRY_SLEEP)
+            logger.warning(f"Connection failed: {e}. Retrying in {RETRY_DELAY}s...")
+            sock.close()
+            time.sleep(RETRY_DELAY)
+    return None
 
-def main():
-    cap, dev = wait_for_camera()
-    frame_count = 0
 
-    while True:
-        sock = connect_socket()
+def get_camera(device_path):
+    """Attempts to open the device, with auto-discovery fallback."""
+    
+    # List of candidates: The config path + any /dev/video* entries
+    candidates = [device_path] + sorted(glob.glob("/dev/video*"))
+    
+    # Remove duplicates while preserving order
+    candidates = list(dict.fromkeys(candidates))
+
+    for current_dev in candidates:
+        if not os.path.exists(current_dev):
+            continue
 
         try:
-            while True:
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    print("[thermal_stream] Frame Error. Resetting camera...")
+            # We use a context manager logic for safety
+            cap = cv2.VideoCapture(current_dev, cv2.CAP_V4L2)
+            
+            # Force MJPG or RAW if supported (Thermal Master likes YUYV or MJPG)
+            # cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            
+            if cap.isOpened():
+                ret, _ = cap.read()
+                if ret:
+                    logger.info(f"Success! Camera opened at {current_dev}")
+                    return cap
+                else:
+                    logger.warning(f"Device {current_dev} opened but returned no frame.")
                     cap.release()
-                    cap, dev = wait_for_camera()
-                    break
-                
-                # Debug Shape every 100 frames
-                if frame_count % 100 == 0:
-                    print(f"[thermal_stream] Raw Shape: {frame.shape}")
-                frame_count += 1
+            else:
+                pass # Just failed to open
+        except Exception as e:
+            logger.warning(f"Error checking {current_dev}: {e}")
 
-                # --- NEW CROP LOGIC (Top-Bottom) ---
-                height, width, channels = frame.shape
-                
-                # Check if image is "Tall" (Stacked Vertically)
+    logger.error("Could not find any working thermal camera.")
+    time.sleep(RETRY_DELAY)
+    return None
+
+
+def main():
+    # Parse arguments for flexibility
+    parser = argparse.ArgumentParser(description="Thermal Camera Streamer")
+    parser.add_argument("--ip", default=DEFAULT_IP, help="Destination IP")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Destination Port")
+    parser.add_argument("--device", default=DEFAULT_DEVICE, help="Path to video device")
+    args = parser.parse_args()
+
+    # Register Signal Handlers (SIGINT=Ctrl+C, SIGTERM=Systemd Stop)
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    # Frame timing
+    frame_interval = 1.0 / TARGET_FPS
+
+    while running:
+        sock = connect_socket(args.ip, args.port)
+        if not sock: break # Shutdown requested during connection
+
+        cap = get_camera(args.device)
+        if not cap: 
+            sock.close()
+            break # Shutdown requested during camera init
+
+        logger.info("Stream loop starting.")
+        
+        try:
+            while running:
+                start_time = time.time()
+
+                ret, frame = cap.read()
+                if not ret:
+                    logger.error("Lost frame from camera. Reinitializing...")
+                    break 
+
+                height, width = frame.shape[:2]
+
+                # --- SLICING LOGIC ---
+                # Detect "Tall" stacking (common in thermal raw feeds)
                 if height > width:
-                    # Take the BOTTOM half (based on your screenshot)
-                    # We assume standard 192 height. 
-                    # If total is 386, we take the last 192 pixels to avoid the padding at the top.
                     target_h = 192
                     if height >= (target_h * 2):
-                        # Safest bet: take exactly 192 lines from the bottom
                         gray_half = frame[height-target_h:, :]
                     else:
-                        # Fallback: Just split in half
                         gray_half = frame[height//2:, :]
                 else:
-                    # Original logic (Side-by-Side)
                     gray_half = frame[:, :width//2]
 
-                # --- COLOR & SEND ---
+                # --- NORMALIZE & COLOR ---
+                # Normalize 16-bit raw data to 8-bit for visualization
+                if gray_half.dtype == np.uint16:
+                    gray_half = cv2.normalize(gray_half, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                elif gray_half.dtype != np.uint8:
+                     # Safety fallback for float or other types
+                    gray_half = cv2.normalize(gray_half, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+
                 inferno_frame = cv2.applyColorMap(gray_half, cv2.COLORMAP_INFERNO)
-
-                h_out, w_out, c_out = inferno_frame.shape
                 
+                # --- PACKET CREATION ---
+                h_out, w_out, c_out = inferno_frame.shape
+                # Header: ! = Network Endian, I = unsigned int (4 bytes)
                 header = struct.pack("!IIII", h_out, w_out, c_out, 0)
-                payload = inferno_frame.tobytes()
-
+                
+                # Send
                 sock.sendall(header)
-                sock.sendall(payload)
+                sock.sendall(inferno_frame.tobytes())
+
+                # --- FPS CONTROL ---
+                elapsed = time.time() - start_time
+                wait_time = frame_interval - elapsed
+                if wait_time > 0:
+                    time.sleep(wait_time)
 
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
-            print(f"[thermal_stream] Socket error: {e}. Reconnecting...")
+            logger.error(f"Network error: {e}. Reconnecting...")
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
         finally:
+            # Clean up resources before restarting loop or exiting
+            if cap: cap.release()
             try: sock.close()
             except: pass
             time.sleep(1)
 
+    logger.info("Service shutdown complete.")
+
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(0)
+    main()

@@ -1,11 +1,7 @@
-/**
- * Commercial-Grade Robot Bridge (C++) - DOUBLE QUEUE VERSION
- * Fix: Implements Queues for BOTH Serial and WebSockets to prevent all crashes.
- */
-
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <boost/bind/bind.hpp>
+#include <boost/system/error_code.hpp>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -16,6 +12,7 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
@@ -76,11 +73,6 @@ public:
 
     void on_accept(beast::error_code ec) {
         if (ec) { alive_ = false; return; }
-        // Logging reduced: Only log if it's NOT latency
-        if(role_ != "LATENCY") {
-             // Optional: Uncomment to see connections once
-             // std::cout << "[" << role_ << "] Connected." << std::endl; 
-        }
         do_read();
     }
 
@@ -92,6 +84,11 @@ public:
         if (ec) { alive_ = false; return; }
 
         std::string msg = beast::buffers_to_string(buffer_.data());
+        
+        if (role_ != "LATENCY" && role_ != "CONTROL") {
+             std::cout << "[RX " << role_ << "]: " << msg << std::endl;
+        }
+
         buffer_.consume(buffer_.size()); 
         if (on_message_) on_message_(msg);
         do_read();
@@ -105,7 +102,7 @@ public:
     void on_send(std::string msg) {
         if (!alive_) return;
         queue_.push_back(msg);
-        if(queue_.size() > 1) return; // Already writing
+        if(queue_.size() > 1) return; 
         do_write();
     }
 
@@ -127,11 +124,9 @@ class Bridge {
     asio::io_context& ioc_;
     asio::serial_port serial_;
     
-    // Serial Reading
     char rx_raw_buffer_[1024]; 
     std::string rx_data_stream_; 
     
-    // Serial Writing Queue (CRITICAL FIX)
     std::deque<std::string> serial_write_queue_;
     
     tcp::acceptor acceptor_telem_;
@@ -187,25 +182,24 @@ public:
         } catch (std::exception& e) {
             std::cerr << "[Serial] ERROR: " << e.what() << ". Retrying..." << std::endl;
             auto timer = std::make_shared<asio::steady_timer>(ioc_, asio::chrono::seconds(2));
-            timer->async_wait([this, timer](const boost::system::error_code&){ connect_serial(); });
+            timer->async_wait([this, timer](const boost::system::error_code& ec){ 
+                this->connect_serial(); 
+            });
         }
     }
 
     void do_read_serial() {
         serial_.async_read_some(asio::buffer(rx_raw_buffer_, sizeof(rx_raw_buffer_)), 
-            [this](boost::system::error_code ec, std::size_t length) {
+            [this](const boost::system::error_code& ec, std::size_t length) {
                 if (!ec) {
                     rx_data_stream_.append(rx_raw_buffer_, length);
 
-                    // Handshake
                     size_t handshake_pos = rx_data_stream_.find("CMD_HELLO");
                     if (handshake_pos != std::string::npos) {
-                        // std::cout << "[Handshake] Sending ACK." << std::endl;
-                        write_serial("ACK_READY"); 
+                        write_serial("ACK_READY\n");
                         rx_data_stream_.erase(handshake_pos, 9); 
                     }
 
-                    // Lines
                     size_t newline_pos;
                     while ((newline_pos = rx_data_stream_.find('\n')) != std::string::npos) {
                         std::string line = rx_data_stream_.substr(0, newline_pos);
@@ -219,10 +213,14 @@ public:
             });
     }
 
-    // --- 3. SERIAL WRITE QUEUE (Prevents Control Crashes) ---
     void write_serial(std::string msg) {
-        // Post to main thread context to manage queue safely
         asio::post(ioc_, [this, msg]() {
+            if (serial_write_queue_.size() > 1) {
+                 std::string active_msg = serial_write_queue_.front();
+                 serial_write_queue_.clear();
+                 serial_write_queue_.push_back(active_msg);
+            }
+
             bool write_in_progress = !serial_write_queue_.empty();
             serial_write_queue_.push_back(msg);
             
@@ -239,14 +237,13 @@ public:
         }
 
         asio::async_write(serial_, asio::buffer(serial_write_queue_.front()), 
-            [this](boost::system::error_code ec, std::size_t) {
+            [this](const boost::system::error_code& ec, std::size_t) {
                 if (!ec) {
                     serial_write_queue_.pop_front();
                     if (!serial_write_queue_.empty()) {
                         do_write_serial();
                     }
                 } else {
-                    // On error, clear queue and maybe reconnect
                     serial_write_queue_.clear();
                 }
             });
@@ -297,7 +294,6 @@ public:
         );
     }
 
-    // --- ACCEPTORS (Standard) ---
     void do_accept_telem() {
         acceptor_telem_.async_accept([this](beast::error_code ec, tcp::socket socket) {
             if (!ec) {
@@ -367,43 +363,40 @@ public:
         gps_timer_.expires_after(std::chrono::seconds(1));
         gps_timer_.async_wait([this](beast::error_code ec) {
             if (!ec) {
-                double t_sec = current_time_ms() / 1000.0;
                 json gps;
                 gps["type"] = "gps";
-                gps["timestamp"] = current_time_ms();
-                gps["lat"] = 39.9334 + (0.0001 * std::sin(t_sec / 10.0));
-                gps["lon"] = 32.8597 + (0.0001 * std::cos(t_sec / 10.0));
-                gps["alt"] = 900;
-                gps["status"] = 0;
-                gps["service"] = 1;
-                gps["position_covariance"] = std::vector<double>(9, 0.0); 
-                gps["position_covariance_type"] = 0;
                 broadcast(gps_clients_, gps.dump());
                 run_gps_loop();
             }
         });
     }
 
-    // --- 4. CONTROL HANDLER (Supports Mode & Velocity) ---
     void on_control_msg(std::string msg) {
         last_control_time = current_time_ms();
         try {
             auto j = json::parse(msg);
             
-            // Handle MODE (e.g., {"mode": "ARMED"})
+            // 1. Handle MODE
             if (j.contains("mode")) {
                 std::string m = j["mode"];
-                // Ensure uppercase if needed, or send raw
-                // We append \n explicitly
-                write_serial(m); 
+                write_serial(m + "\n"); 
             }
 
-            // Handle Velocity (e.g., {"v": 0.5, "w": 0.1})
+            // 2. Handle Velocity
             if (j.contains("v") && j.contains("w")) {
                 char cmd[64];
-                snprintf(cmd, sizeof(cmd), "{v=%.2f, w=%.2f}", (double)j["v"], (double)j["w"]);
+                snprintf(cmd, sizeof(cmd), "{v=%.2f, w=%.2f}\n", (double)j["v"], (double)j["w"]);
                 write_serial(cmd);
             }
+
+            // 3. Handle Camera LED (New logic)
+            if (j.contains("cam_led")) {
+                int led_val = j["cam_led"];
+                // Formats as "cam_led:XX\n" to match STM32 protocol
+                std::string led_cmd = "cam_led:" + std::to_string(led_val) + "\n";
+                write_serial(led_cmd);
+            }
+
         } catch(...) {}
     }
 
@@ -411,10 +404,7 @@ public:
         safety_timer_.expires_after(std::chrono::milliseconds(100));
         safety_timer_.async_wait([this](beast::error_code ec) {
             if (!ec && (current_time_ms() - last_control_time > 500)) {
-                // Safety Timeout
-                write_serial("{v=0.00, w=0.00}");
-
-		write_serial("IDLE");
+                write_serial("{v=0.00, w=0.00}\n");
             }
             run_safety_loop();
         });
@@ -425,8 +415,7 @@ int main() {
     try {
         asio::io_context ioc;
         Bridge bridge(ioc);
-        std::cout << "--- ROBOT BRIDGE (DOUBLE QUEUE STABLE) STARTED ---" << std::endl;
-        std::cout << "Ports: 8080(Tel), 8081(Sts), 8082(GPS), 8766(Ctrl), 9090(Lat)" << std::endl;
+        std::cout << "--- ROBOT BRIDGE (OPTIMIZED) STARTED ---" << std::endl;
         ioc.run();
     } catch (std::exception& e) {
         std::cerr << "FATAL: " << e.what() << std::endl;
